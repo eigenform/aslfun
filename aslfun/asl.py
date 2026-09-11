@@ -1,18 +1,18 @@
-#!/usr/bin/env python3
-
-""" asl-decoder-tree.py
-
-Recover mask/match pairs for encodings in `arch_decode.asl` (produced with
-[`alastairreid/mra_tools`](https://github.com/alastairreid/mra_tools)). 
-
-Most of this code is derived from [`alehed/aslutils`](https://github.com/alehed/aslutils), 
-specifically [`parse_asl_file.py`](https://github.com/alehed/aslutils/blob/master/aslutils/parse_asl_file.py).
 
 """
+Hacky parsing for ASL files, specifically `arch_decode.asl` produced with 
+[https://github.com/alastairreid/mra_tools].
+
+Most of this code is derived from [https://github.com/alehed/aslutils]
+(specifically, `aslutils/parse_asl_file.py`). 
+"""
+
 
 import re
 import copy
 import json
+import typing
+
 DECODE_RE       = r"__decode ([a-zA-Z]\w*)"
 FIELD_RE        = r"__field ([a-zA-Z]\w*) (\d+) \+: (\d+)"
 
@@ -38,11 +38,9 @@ def mask_from_match(bitstr):
     """ Given some field bitstring in a 'when' statement, return the submask.
     """
     if "x" not in bitstr: 
-        return int(bitstr.replace("0", "1"))
+        return int(bitstr.replace("0", "1"), 2)
     else:
         return int(bitstr.replace("0", "1").replace("x", "0"), 2)
-
-
 
 class AslNode:
     def __init__(self, data: str):
@@ -92,7 +90,7 @@ class AslFile:
 
 class FieldDecl():
     def __str__(self):
-        return "FieldDecl({}, {}, {})".format(self.name, self.start, self.length)
+        return "FieldDecl(name={}, start={}, len={})".format(self.name, self.start, self.length)
     def __init__(self, name, start, length):
         self.name = name
         self.start = int(start)
@@ -118,13 +116,14 @@ class WhenDecl():
         self.terminal = terminal
 
 class EncodingTree:
+    """ Tree for a particular encoding """
     def __init__(self, case_stack, when_stack, data):
         self.case_stack = case_stack
         self.when_stack = when_stack
         self.data = data
 
-
 class AslVisitor:
+    """ Walk an ASL tree and recover all the encodings """
     def __init__(self):
         self.encodings = []
         self.case_stack = []
@@ -208,6 +207,7 @@ class AslVisitor:
 class Case():
     def __init__(self, decl: CaseDecl):
         self.fields = []
+        self.field_decls = decl.field_decls
         for f in decl.fields: 
             self.fields.append(CaseField(f, decl.field_decls))
 
@@ -304,71 +304,118 @@ class WhenField():
         self.mask = mask_from_match(m.groups()[1])
         if self.mask != None:
             self.mask <<= field.start
+            if self.mask > 0xffff_ffff: 
+                raise Exception("uhhhhh??")
 
         self.value = value_from_match(m.groups()[1]) << field.start
  
-class Encoding:
-    def __str__(self):
-        return "{:08x} {:08x} {}".format(self.mask, self.val, self.name)
-    def __init__(self, name, mask, val):
-        namestr = name.strip().replace("__encoding", "").replace(" ", "")
-        namestr = namestr.lstrip("A64_")
-
-        self.name = namestr
-        self.mask = mask
-        self.val = val
-
-class EncodingDb:
+class AslTreeToJson:
+    """ Walk an ASL tree and convert into a JSON representation """
     def __init__(self):
-        self.encodings = []
-    def stats(self):
-        stats = {}
-        for enc in self.encodings:
-            s = enc.name.split("_")
-            n = "_".join(s[0:1])
-            if n in stats:
-                stats[n] += 1
+        self.case_stack = []
+        self.field_stack = []
+        self.when_stack = []
+
+    def walk(self, node: AslNode, idt=0) -> dict:
+
+        if node.data.startswith("__decode"): 
+            children = []
+            for child in node.children:
+                c = self.walk(child, idt=idt+1)
+                children.append(c)
+            return { "decode": children }
+
+        elif node.data.startswith("__field"): 
+            assert not node.has_children()
+            m = re.fullmatch(FIELD_RE, node.data)
+            f = m.groups()
+            decl = FieldDecl(f[0], f[1], f[2])
+            self.field_stack.append(decl)
+            return None
+
+        elif node.data.startswith("case"): 
+            assert node.has_children()
+            empty_m = re.fullmatch(CASE_EMPTY_RE, node.data)
+            fields = []
+                
+            if empty_m:
+                fields = []
             else:
-                stats[n] = 1
-        return stats
+                m = re.fullmatch(CASE_RE, node.data)
+                fields = m.groups()[0].split(", ")
 
-    def add(self, enc: Encoding):
-        self.encodings.append(enc)
-
-    def dump(self):
-        for enc in db.encodings:
-            print("(0x{:08x}, 0x{:08x}, \"{}\"),".format(
-                enc.mask, enc.val, enc.name.lstrip().rstrip().replace("__encoding", "")
-            ))
-
-
-if __name__ == "__main__":
-    db = EncodingDb()
-
-    f = AslFile("./arch_decode.asl")
-    v = AslVisitor()
-    v.walk(f.tree[0])
-
-    for enc in v.encodings:
-
-        constraint_mask = 0x0000_0000
-        constraint_val  = 0x0000_0000
-        for (case_decl, when_decl) in zip(enc.case_stack, enc.when_stack):
+            case_decl = CaseDecl(fields, copy.deepcopy(self.field_stack))
+            #print(case_decl)
             case = Case(case_decl)
-            when = When(when_decl, case)
+            mask = 0
+            for field in case.fields:
+                mask = mask | field.mask
 
-            for (case_field, when_field) in zip(case.fields, when.fields):
-                if when_field.mask == None and when_field.value == None:
+            # Collect children for this 'case' node
+            self.case_stack.append(case_decl)
+            children = []
+            for child in node.children:
+                c = self.walk(child, idt=idt+1)
+                if c != None: children.append(c)
+            self.case_stack.pop()
+
+            return { "case": mask, "children": children }
+
+        elif node.data.startswith("when"): 
+            empty_m = re.match(WHEN_EMPTY_RE, node.data)
+            vals_m = re.match(WHEN_VALS_RE, node.data)
+            if empty_m:
+                vals = []
+                terminal = node.data[empty_m.end():]
+            elif vals_m:
+                vals = vals_m.groups()[0].split(", ")
+                terminal = node.data[vals_m.end():]
+
+            when_decl = WhenDecl(vals, terminal)
+            #print(when_decl)
+            this_case_decl = self.case_stack[-1]
+            this_case = Case(this_case_decl)
+            when = When(when_decl, this_case)
+            #print([str(s) for s in when.fields])
+
+            mask = 0
+            value = 0
+            for field in when.fields:
+                if field.value == None and field.mask == None:
                     continue
-                #print(case_field, when_field)
-                effective_mask = case_field.mask & when_field.mask
-                constraint_mask |= effective_mask
-                constraint_val  |= when_field.value
+                mask = mask | field.mask
+                value = value | field.value
 
-        db.add(Encoding(enc.data, constraint_mask, constraint_val))
+            if mask > 0xffff_ffff:
+                for f in this_case.fields:
+                    print(f)
+                for f in when.fields:
+                    print(f)
+                raise Exception("uhhh")
 
-    #print("// Stats: {}".format(json.dumps(db.stats(), indent=1)))
+            d = { "when_mask": mask, "when_value": value }
 
-    db.dump()
 
+            if not node.has_children():
+                d['terminal'] = terminal
+
+            # Collect children for this 'when' node
+            self.when_stack.append(when)
+            children = []
+            for child in node.children:
+                c = self.walk(child, idt=idt+1)
+                if c != None: children.append(c)
+            self.when_stack.pop()
+
+            if len(children) != 0:
+                d['children'] = children
+
+            self.field_stack = []
+            return d
+
+        else:
+            print(f"Unexpected input: {node.data}")
+            exit(-1)
+
+        pass
 
